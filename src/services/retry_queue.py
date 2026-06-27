@@ -32,6 +32,7 @@ from src.utils.redis_client import redis_client
 logger = logging.getLogger(__name__)
 
 RETRY_QUEUE_KEY = "postcall:retry_queue"
+DEAD_LETTER_QUEUE = "postcall:dead_letter"
 RETRY_STATE_PREFIX = "postcall:retry_state:"
 
 
@@ -65,30 +66,48 @@ class PostCallRetryQueue:
         current_attempt = int(await redis_client.get(state_key) or 0)
 
         if current_attempt >= self.max_retries:
+            dead_letter = {
+                "interaction_id": interaction_id,
+                "payload": payload,
+                "last_error": error,
+                "failed_at": time.time(),
+            }
+
+            await redis_client.rpush(
+                DEAD_LETTER_QUEUE,
+                json.dumps(dead_letter),
+            )
+
             logger.error(
                 "retry_exhausted",
                 extra={
                     "interaction_id": interaction_id,
                     "attempts": current_attempt,
-                    "last_error": error,
-                    # The payload containing the full transcript and context
-                    # is dropped here. There's no dead-letter store.
-                    # If you need to replay this interaction, you have to find
-                    # the original payload in logs and manually re-enqueue it.
+                    "dead_letter_queue": DEAD_LETTER_QUEUE,
                 },
             )
+
             return False
 
         next_attempt = current_attempt + 1
+        backoff = self.retry_delay * (2 ** (next_attempt - 1))
         entry = {
             "interaction_id": interaction_id,
             "attempt": next_attempt,
             "last_error": error,
-            "next_retry_at": time.time() + self.retry_delay,
+            "next_retry_at":  time.time() + backoff,
             "payload": payload,
         }
 
-        await redis_client.set(state_key, next_attempt)
+        await redis_client.set(
+    state_key,
+    next_attempt,
+)
+
+        await redis_client.expire(
+    state_key,
+    86400,
+)
         # No TTL set on state_key — this key lives in Redis indefinitely
         # for interactions that exhaust their retries.
 
@@ -97,9 +116,10 @@ class PostCallRetryQueue:
         logger.info(
             "retry_enqueued",
             extra={
-                "interaction_id": interaction_id,
-                "attempt": next_attempt,
-                "next_retry_at": entry["next_retry_at"],
+               "interaction_id": interaction_id,
+    "attempt": next_attempt,
+    "next_retry_at": entry["next_retry_at"],
+    "queue_depth": await self.get_queue_depth(),
             },
         )
         return True
