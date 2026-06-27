@@ -34,6 +34,7 @@ but instead naturally dispatches fewer calls when LLM capacity is constrained?
 The capacity signal already exists — it just needs to be used differently.
 """
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass
@@ -106,9 +107,49 @@ class PostCallCircuitBreaker:
         # but this check won't see it until RPM also spikes.
         usage_ratio = current_rpm / max_rpm if max_rpm > 0 else 0
 
-        if usage_ratio >= self._capacity_threshold:
-            self._trip(agent_id)
+        # Gradual backpressure instead of binary freeze
+        if usage_ratio >= 0.95:
+            logger.error(
+                "llm_capacity_exhausted",
+                extra={
+                    "agent_id": agent_id,
+                    "usage_ratio": round(usage_ratio, 2),
+                },
+            )
             return False
+
+        if usage_ratio >= 0.90:
+            logger.warning(
+                "high_capacity_backpressure",
+                extra={
+                    "agent_id": agent_id,
+                    "delay": 5,
+                    "usage_ratio": round(usage_ratio, 2),
+                },
+            )
+            await asyncio.sleep(5)
+
+        elif usage_ratio >= 0.80:
+            logger.warning(
+                "medium_capacity_backpressure",
+                extra={
+                    "agent_id": agent_id,
+                    "delay": 3,
+                    "usage_ratio": round(usage_ratio, 2),
+                },
+            )
+            await asyncio.sleep(3)
+
+        elif usage_ratio >= 0.70:
+            logger.info(
+                "light_capacity_backpressure",
+                extra={
+                    "agent_id": agent_id,
+                    "delay": 1,
+                    "usage_ratio": round(usage_ratio, 2),
+                },
+            )
+            await asyncio.sleep(1)
 
         return True
 
