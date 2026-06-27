@@ -31,6 +31,7 @@ import logging
 from datetime import datetime
 from typing import Any, Dict, Optional
 from uuid import UUID
+import uuid
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel
@@ -80,10 +81,22 @@ async def end_interaction(
     4. Return 200 before anything actually processes
     """
     try:
+        correlation_id = str(uuid.uuid4())
+
+        logger.info(
+            "interaction_end_received",
+            extra={
+                "interaction_id": str(interaction_id),
+                "session_id": str(session_id),
+                "correlation_id": correlation_id,
+            },
+        )
+
         interaction = await _load_interaction(interaction_id)
 
         if not interaction:
             raise HTTPException(status_code=404, detail="Interaction not found")
+
 
         await _update_interaction_status(
             interaction_id=str(interaction_id),
@@ -102,27 +115,12 @@ async def end_interaction(
             # Signal jobs still fire so the lead stage gets updated.
             logger.info(
                 "short_transcript_fast_path",
-                extra={"interaction_id": str(interaction_id)},
+                extra={
+                    "interaction_id": str(interaction_id),
+                    "correlation_id": correlation_id,
+                },
             )
-
-            # These asyncio.create_tasks share the FastAPI event loop.
-            # If the server restarts between the 200 response and these
-            # completing, they vanish with no trace. No retry, no record.
-            asyncio.create_task(
-                trigger_signal_jobs(
-                    interaction_id=str(interaction_id),
-                    session_id=str(session_id),
-                    campaign_id=interaction["campaign_id"],
-                    analysis_result={"call_stage": "short_call"},
-                )
-            )
-            asyncio.create_task(
-                update_lead_stage(
-                    lead_id=interaction["lead_id"],
-                    interaction_id=str(interaction_id),
-                    call_stage="short_call",
-                )
-            )
+            # LLM skipped for short transcript.
 
         else:
             # Long transcript: pack everything into a Celery payload and enqueue.
@@ -158,7 +156,10 @@ async def end_interaction(
                 "postcall_enqueued",
                 extra={
                     "interaction_id": str(interaction_id),
+                    "correlation_id": correlation_id,
                     "celery_task_id": task.id,
+                    "customer_id": interaction["customer_id"],
+                    "campaign_id": interaction["campaign_id"],
                     # Notice what's NOT logged here: no queue depth, no estimated
                     # wait time, no indication of how backed up we are.
                 },
@@ -168,26 +169,19 @@ async def end_interaction(
             # analysis_result={} means downstream gets an empty analysis.
             # This was supposed to be a "best effort early trigger" but it
             # mostly just sends empty payloads to signal_jobs.
-            asyncio.create_task(
-                trigger_signal_jobs(
-                    interaction_id=str(interaction_id),
-                    session_id=str(session_id),
-                    campaign_id=interaction["campaign_id"],
-                    analysis_result={},  # ← Celery hasn't run yet. This is empty.
-                )
-            )
-            asyncio.create_task(
-                update_lead_stage(
-                    lead_id=interaction["lead_id"],
-                    interaction_id=str(interaction_id),
-                    call_stage="processing",  # ← Placeholder, not a real outcome
-                )
-            )
+
+        logger.info(
+            "interaction_processing_started",
+            extra={
+                "interaction_id": str(interaction_id),
+                "correlation_id": correlation_id,
+            },
+        )
 
         return InteractionEndResponse(
-            status="ok",
+            status="accepted",
             interaction_id=str(interaction_id),
-            message="Interaction ended, processing enqueued",
+            message="Post-call processing started",
         )
 
     except HTTPException:

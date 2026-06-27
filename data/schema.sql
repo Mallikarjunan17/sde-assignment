@@ -140,3 +140,59 @@ INSERT INTO interactions (id, session_id, lead_id, campaign_id, customer_id, age
         '{"transcript": [{"role": "agent", "content": "Hello—"}, {"role": "customer", "content": "Wrong number"}]}',
         '{"analysis_status": "pending"}'
     );
+
+
+-- =====================================================
+-- Added for scalable post-call processing
+-- =====================================================
+
+CREATE TABLE customer_llm_budget (
+    customer_id UUID PRIMARY KEY,
+    reserved_tokens_per_minute INTEGER NOT NULL,
+    max_requests_per_minute INTEGER NOT NULL,
+    priority INTEGER DEFAULT 1,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE analysis_jobs (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    interaction_id UUID REFERENCES interactions(id),
+    customer_id UUID,
+    campaign_id UUID,
+    correlation_id UUID,
+    priority VARCHAR(20) DEFAULT 'NORMAL',
+    status VARCHAR(30) DEFAULT 'QUEUED',
+    estimated_tokens INTEGER,
+    actual_tokens INTEGER,
+    retry_count INTEGER DEFAULT 0,
+    last_error TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ
+);
+
+CREATE TABLE audit_logs (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    interaction_id UUID,
+    correlation_id UUID,
+    event_name VARCHAR(100),
+    status VARCHAR(50),
+    details JSONB,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+ALTER TABLE interactions
+ADD COLUMN IF NOT EXISTS correlation_id UUID;
+
+ALTER TABLE interactions
+ADD COLUMN IF NOT EXISTS processing_priority VARCHAR(20) DEFAULT 'NORMAL';
+
+ALTER TABLE interactions
+ADD COLUMN IF NOT EXISTS estimated_tokens INTEGER;
+
+ALTER TABLE interactions
+ADD COLUMN IF NOT EXISTS actual_tokens INTEGER;
+
+ALTER TABLE interactions
+ADD COLUMN IF NOT EXISTS analysis_status VARCHAR(30) DEFAULT 'QUEUED';

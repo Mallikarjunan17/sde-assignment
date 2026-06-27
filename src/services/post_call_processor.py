@@ -27,8 +27,14 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 from dataclasses import dataclass
 
+
 from src.config import settings
 from src.services.circuit_breaker import circuit_breaker
+from src.services.llm_scheduler import (
+    llm_scheduler,
+    ScheduledJob,
+)
+
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +103,39 @@ class PostCallProcessor:
         # called by the dialler — not here, before spending the tokens.
         await circuit_breaker.record_postcall_start()
 
+        estimated_tokens = llm_scheduler.estimate_tokens(
+            ctx.transcript_text
+        )
+
+        allowed = llm_scheduler.acquire(
+            customer_id=ctx.customer_id,
+            estimated_tokens=estimated_tokens,
+        )
+
+        if not allowed:
+
+            llm_scheduler.defer(
+                ScheduledJob(
+                    interaction_id=ctx.interaction_id,
+                    customer_id=ctx.customer_id,
+                    priority="NORMAL",
+                    estimated_tokens=estimated_tokens,
+                )
+            )
+
+            logger.warning(
+                "interaction_deferred",
+                extra={
+                    "interaction_id": ctx.interaction_id,
+                    "customer_id": ctx.customer_id,
+                    "estimated_tokens": estimated_tokens,
+                },
+            )
+
+            raise RuntimeError(
+                "LLM capacity exhausted. Interaction deferred."
+            )
+
         try:
             prompt = self._build_analysis_prompt(
                 ctx.transcript_text,
@@ -146,6 +185,7 @@ class PostCallProcessor:
             raise
 
         finally:
+            llm_scheduler.release()
             await circuit_breaker.record_postcall_end()
 
     def _build_analysis_prompt(
@@ -236,9 +276,15 @@ Respond in JSON format:
         logger.info(
             "metadata_updated",
             extra={
-                "interaction_id": interaction_id,
-                "call_stage": result.call_stage,
-            },
+    "interaction_id": ctx.interaction_id,
+    "customer_id": ctx.customer_id,
+    "campaign_id": ctx.campaign_id,
+    "call_stage": result.call_stage,
+    "tokens_used": result.tokens_used,
+    "estimated_tokens": estimated_tokens,
+    "queue_depth": llm_scheduler.queue_depth(),
+    "latency_ms": result.latency_ms,
+},
         )
 
 

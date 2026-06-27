@@ -37,6 +37,7 @@ The capacity signal already exists — it just needs to be used differently.
 import asyncio
 import logging
 import time
+
 from dataclasses import dataclass
 from typing import Dict, Optional
 
@@ -173,13 +174,11 @@ class PostCallCircuitBreaker:
         logger.error(
             "circuit_breaker_tripped",
             extra={
-                "agent_id": agent_id,
-                "freeze_seconds": self._freeze_seconds,
-                "capacity_threshold": self._capacity_threshold,
-                # Would be useful to also log: current_rpm, current_tpm,
-                # queue_depth, and which customer's calls triggered the spike.
-                # None of that is available here.
-            },
+    "agent_id": agent_id,
+    "freeze_seconds": self._freeze_seconds,
+    "capacity_threshold": self._capacity_threshold,
+    "recommendation": "Use gradual backpressure instead of binary freeze",
+},
         )
 
     async def record_postcall_start(self):
