@@ -1,4 +1,4 @@
-# Post-Call Processing Pipeline — System Design & Implementation Challenge
+
 
 # Post-Call Processing Pipeline — Design Document
 
