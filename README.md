@@ -1,243 +1,289 @@
-# Post-Call Processing Pipeline — System Design & Implementation Challenge
+# Post-Call Processing Pipeline — Design Document
 
-## Overview
-
-You are a backend engineer on a voice AI platform that automates outbound calling campaigns for B2B customers. The platform handles ~100,000 calls per campaign run across multiple customers simultaneously.
-
-When a call ends, the system must:
-1. Fetch and store the call recording
-2. Analyze the conversation transcript using an LLM
-3. Extract entities, classify the call outcome, and update the dashboard
-4. Push results to the customer's CRM (if configured)
-5. Trigger downstream actions (follow-up messages, lead stage updates)
-
-**The current implementation breaks at scale.** Your job is to identify the problems, design a better system, and implement the most critical parts.
+**Author:** Mallikarjuna N
+**Date:** 27 June 2026
 
 ---
 
-## The Current System (What You're Starting With)
+## 1. Assumptions
 
-The codebase in `src/` is a working but flawed implementation. Spend time reading it before writing anything.
+1. The LLM provider enforces strict Requests Per Minute (RPM) and Tokens Per Minute (TPM) limits.
+2. Multiple customers execute campaigns concurrently.
+3. Every customer has a configurable LLM token allocation based on subscription.
+4. Short transcripts (less than four turns) do not require LLM analysis.
+5. Call recordings are generated asynchronously by the telephony provider.
+6. PostgreSQL is the durable system of record.
+7. Redis is used only for caching, coordination and scheduling.
+8. Business-critical calls should receive higher processing priority than informational calls.
 
-### Architecture (Current)
+---
+
+## 2. Problem Diagnosis
+
+The existing implementation works for low traffic but fails at production scale.
+
+The major problems identified are:
+
+* A fixed `asyncio.sleep(45)` delays processing unnecessarily.
+* Recording upload failures are silently ignored.
+* Celery and Redis together do not provide durable workflow execution.
+* Every completed call immediately invokes the LLM without considering provider limits.
+* There is no per-customer quota enforcement.
+* The circuit breaker completely freezes outbound calling instead of gradually reducing throughput.
+* Fire-and-forget tasks may be lost if the API server restarts.
+* There is no complete audit trail across the processing pipeline.
+
+---
+
+## 3. Architecture Overview
 
 ```
-POST /session/{sid}/interaction/{iid}/end
-            │
-    FastAPI BackgroundTask
-    ├── Short transcript check (< 4 turns → skip LLM)
-    ├── asyncio.create_task (signal jobs, lead stage) ← fire-and-forget, lost on restart
-    └── Celery: process_interaction_end_background_task
-                    │
-            ┌───────▼────────────────────────┐
-            │  PostCallCircuitBreaker         │
-            │  PostCallProcessor → LLM        │
-            │  asyncio.sleep(45s) → recording │
-            │  PostCallRetryQueue (Redis)      │
-            └────────────────────────────────┘
+                    Exotel Webhook
+                          |
+                          v
+                  FastAPI Endpoint
+                          |
+                          v
+               Durable Processing Queue
+                          |
+          +---------------+---------------+
+          |                               |
+          v                               v
+ Recording Poller                 LLM Scheduler
+ (Retry + Backoff)          (Rate Limit Aware)
+          |                               |
+          v                               v
+     Upload to S3                Post Call Processor
+                                          |
+                    +---------------------+----------------------+
+                    |                     |                      |
+                    v                     v                      v
+              Dashboard Update       CRM Push           Lead Stage Update
+                                          |
+                                          v
+                                     Audit Logs
 ```
 
-### Key Files
+### Key design decisions
 
-| File | What It Does |
-|------|-------------|
-| `src/api/endpoints.py` | FastAPI endpoint — receives call-end webhook from telephony provider |
-| `src/tasks/celery_tasks.py` | Celery task — orchestrates all post-call processing |
-| `src/services/post_call_processor.py` | LLM analysis — runs on every completed call |
-| `src/services/recording.py` | Recording fetch + S3 upload |
-| `src/services/circuit_breaker.py` | Attempts to protect the dialler from LLM overload |
-| `src/services/retry_queue.py` | Redis-based retry for failed tasks |
-| `src/config.py` | All configuration — note the LLM rate limit settings |
-
-### Known Failure Modes
-
-The inline comments throughout the codebase describe specific problems. The most severe ones to address:
-
-1. **`asyncio.sleep(45s)` recording gate.** The system blindly waits 45 seconds for the recording to appear. Recordings delivered after that are silently skipped — no retry, no alert, no visibility.
-
-2. **Tasks drop silently.** If Redis (the Celery broker) restarts, in-flight tasks are lost. The retry queue is also Redis-backed — a Redis failure means double loss. There is no durable execution or dead-letter mechanism.
-
-3. **The circuit breaker is too blunt.** At ≥90% LLM capacity, it freezes ALL outbound dialling for the affected agent for 1800 seconds. A post-call backlog directly stops new calls — a cascading failure with no gradual fallback.
-
-4. **No rate limit awareness.** There is a harder version of the capacity problem that the current system does not handle at all: LLM APIs have hard rate limits (tokens per minute, requests per minute). At 100K calls arriving rapidly, the system fires LLM requests at full speed and fails with 429s — no queuing, no scheduling, no budget management.
+1. The webhook immediately acknowledges the request and delegates processing.
+2. Recording retrieval and LLM analysis are independent.
+3. A scheduler controls all LLM traffic.
+4. Every interaction receives a correlation ID.
+5. Structured audit logs are written throughout the workflow.
 
 ---
 
-## The Core Problem to Solve
+## 4. Rate Limit Management
 
-> **LLM APIs have hard rate limits. The current system has no awareness of them.**
+The redesigned solution introduces an LLM Scheduler.
 
-Consider what happens during a campaign run:
+Before every LLM request the scheduler verifies:
 
-- 100,000 calls complete within a few hours
-- Every call fires an LLM request (current behaviour)
-- LLM provider limit: e.g., 500 requests/min, 90,000 tokens/min
-- At peak, the system tries to send 5,000+ requests/min → 429 rate limit errors → Celery retries pile up → Redis fills → more failures
+* Requests Per Minute (RPM)
+* Tokens Per Minute (TPM)
 
-The system has to decide, across 100K calls:
-- Which analysis results are needed **now** (business can't wait)
-- Which can be **deferred** to a time when rate limit headroom exists
-- How to **allocate** the available rate limit fairly across multiple customers running campaigns simultaneously
+If sufficient capacity exists, processing begins immediately.
 
-This is not purely a technical throughput problem. The business has context that the system does not: some call outcomes matter more than others, and some customers have higher priority or pre-allocated budgets. Your design must create a way to express and enforce that context.
+If capacity is unavailable:
 
-**What "some calls need immediate processing" means in practice** is something you need to reason about and state as an assumption. The codebase gives you sample transcripts with varied outcomes — use them to inform your thinking. How you distinguish urgent from deferrable, and what mechanism you use to do so, is a core part of the design question.
+* urgent interactions enter a high-priority queue,
+* normal interactions are deferred,
+* retries occur automatically after capacity becomes available.
 
----
-
-## The Challenge
-
-Design and implement a new post-call processing pipeline. You will deliver two things:
-
-### Part 1: Design Document (`SUBMISSION.md`)
-
-Write your technical design. It must cover:
-
-1. **Assumptions** — What did you assume about the business, the system, or the environment? State them explicitly upfront. We will discuss them.
-
-2. **Architecture overview** — End-to-end flow from call-end webhook to completed analysis. Include a diagram.
-
-3. **Rate limit management** — This is the primary problem. How does your system respect LLM rate limits across 100K calls and multiple concurrent customers? How does it decide what to process now vs. later? How does it recover gracefully when limits are hit?
-
-4. **Per-customer token budgeting** — If the platform has a total LLM budget of N tokens/min and K active customers, how do you allocate it? For example: if total capacity is 100 tokens/min and Customer A pre-allocates 20, what guarantees do they get? What happens when they exceed their budget? What happens to unallocated headroom?
-
-5. **Recording pipeline fix** — Replace the 45-second sleep. What does a robust polling/retry mechanism look like, and how do you ensure failures are always visible?
-
-6. **Reliability & durability** — How do you ensure no analysis result is permanently lost? What replaces the fragile Celery + Redis combination?
-
-7. **Auditability & observability** — What do you log? How would an on-call engineer debug a specific failed interaction 3 days later? What alerts fire and on what conditions?
-
-8. **Data model** — What schema changes does your design require?
-
-9. **Security** — What data is sensitive in this system, and how do you protect it? (Consider: transcripts contain conversation data, lead PII, and call recordings.)
-
-10. **Trade-offs** — What did you consider and reject? What are the known weaknesses of your design?
-
-### Part 2: Implementation
-
-Implement the highest-impact parts of your design. The scope is deliberately larger than any single session — we are evaluating judgment as much as execution.
-
-**Must implement:**
-- [ ] Rate limit–aware LLM request scheduling (the core fix)
-- [ ] Per-customer token budget enforcement
-- [ ] Recording poller with retry/backoff (replacing `asyncio.sleep(45s)`)
-- [ ] Durable task execution — no silent drops on infrastructure failure
-- [ ] Structured audit logging — every interaction traceable from call-end to result
-
-**Should implement:**
-- [ ] Differentiated processing paths (some calls processed now, others deferred) — your design decides the mechanism
-- [ ] Data model changes with schema migration
-- [ ] Alert thresholds tied to rate limit utilisation
-- [ ] Tests validating rate limit behaviour under load (can be simulated)
-
-**Nice to have:**
-- [ ] Encryption at rest for transcripts and recordings
-- [ ] Per-customer configuration for processing behaviour (no deployment required to change)
-- [ ] CRM push with retry logic and status tracking
-- [ ] Gradual dialler backpressure replacing the binary circuit breaker
+This prevents HTTP 429 errors while keeping provider limits respected.
 
 ---
 
-## Constraints
+## 5. Per-Customer Token Budgeting
 
-1. **No analysis result may be permanently lost.** If a processing step fails, there must be a retry mechanism with visibility. Silent drops are not acceptable.
+Each customer receives a reserved token allocation.
 
-2. **The system must handle 100K calls per campaign run** while respecting LLM rate limits — never triggering unhandled 429 errors.
+Example:
 
-3. **All LLM spending must be attributable.** Every token consumed must be traceable to a customer, campaign, and interaction. This is required for both billing and debugging.
+* Total Capacity = 90,000 TPM
+* Customer A = 20,000 TPM Reserved
+* Customer B = 15,000 TPM Reserved
+* Remaining capacity becomes a shared pool.
 
-4. **Recording failures must produce observable events.** Every recording that fails to upload must log a structured, alertable event. Silent skips are not acceptable.
+If a customer exceeds their reserved allocation:
 
-5. **The solution must be testable locally** with `docker-compose up` (Postgres + Redis) and mock LLM responses. No real API keys required to run tests.
+* reserved quota is consumed first,
+* additional requests use shared capacity if available,
+* otherwise requests are queued.
 
-6. **Justify your interface decisions.** If you change the API contract (`POST /session/.../end`) or the data model, explain why in `SUBMISSION.md`.
-
----
-
-## Acceptance Criteria
-
-| # | Criterion | How We Verify |
-|---|-----------|--------------|
-| AC1 | System never fires LLM requests beyond configured rate limits | Test: simulate burst of 1000 calls, assert no 429s surfaced to callers |
-| AC2 | Per-customer token budget enforced — Customer A's budget does not consume Customer B's allocation | Unit test: exhaust Customer A's budget, verify Customer B's calls still process |
-| AC3 | No task is permanently lost when Redis or Celery worker restarts mid-processing | Integration test: kill worker mid-task, verify task resumes on restart |
-| AC4 | Recording poller retries with backoff; never silently skips | Unit test: simulate delayed recording, verify retry loop and failure logging |
-| AC5 | Every interaction has a complete audit trail from call-end to final result | Log inspection: assert structured events exist for each stage of one interaction |
-| AC6 | All failures produce structured log events with `interaction_id` | Code inspection: every error path emits structured log with correlation ID |
-| AC7 | Dialler is not binary-frozen when LLM is under load | Design doc + code: no hardcoded 1800s freeze; backpressure is proportional |
-| AC8 | Short transcripts (< 4 turns) never consume LLM quota | Test: short transcript → no LLM call, interaction status updated directly |
-| AC9 | Design doc states assumptions clearly and defends trade-offs | Manual review: assumptions are explicit, not implicit |
-| AC10 | Sensitive data (transcripts, PII) identified and protection strategy stated | Design doc: security section addresses data at rest and in transit |
+Unused reserved capacity can temporarily be borrowed by other customers.
 
 ---
 
-## Evaluation Criteria
+## 6. Differentiated Processing
 
-### 1. Problem Framing (25%)
-- Did the candidate correctly identify rate limit management as the root problem?
-- Are assumptions stated explicitly and reasonably?
-- Does the design doc show understanding of how business context (urgency, customer priority) connects to technical decisions?
+Calls are divided into two categories.
 
-### 2. System Design (35%)
-- Is the rate limit management strategy sound at 100K call scale?
-- Is the per-customer budget model well-reasoned?
-- Are failure modes addressed with real solutions, not hand-waving?
-- Does the design handle the recording pipeline, durability, and observability?
+**High Priority**
 
-### 3. Code Quality (25%)
-- Is the implementation clean and production-ready?
-- Does it actually integrate with the existing codebase, or is it floating code?
-- Error handling: does the system fail gracefully with visibility?
+* Demo booked
+* Callback scheduled
+* Sale confirmed
+* Customer requested follow-up
 
-### 4. Communication (15%)
-- Is the design document clear enough for a new team member to implement from?
-- Are decisions explained, not just stated?
-- Does the candidate surface the right questions?
+These are processed immediately.
 
----
+**Normal Priority**
 
-## Rules
+* Wrong number
+* Spam
+* Not interested
+* No response
 
-- **You may use AI tools** (Copilot, ChatGPT, Claude, etc.). This is explicitly allowed.
-  - You must be able to **explain every design decision** in your submission and in the follow-up discussion
-  - AI-generated design that isn't adapted to this specific system will be visible
-  - AI-generated code that doesn't integrate with the existing codebase is penalised
+These are processed later whenever capacity becomes available.
 
-- **Submit via git.** A clean commit history showing your progression is part of the submission. Atomic commits with clear messages matter.
-
-- **State your assumptions.** If something is ambiguous, don't guess silently — write it down in `SUBMISSION.md` and proceed. Reasonable assumptions are part of what we're evaluating.
+This prioritization ensures business-critical interactions are never delayed.
 
 ---
 
-## Getting Started
+## 7. Recording Pipeline
 
-```bash
-# 1. Read the current system — understand before changing
-cat src/config.py                        # Note the rate limit settings
-cat src/tasks/celery_tasks.py            # The main processing pipeline
-cat src/services/recording.py            # The 45s sleep
-cat src/services/circuit_breaker.py      # The blunt capacity check
+The fixed 45-second delay is replaced with retry polling.
 
-# 2. Read the sample transcripts — these are your test cases
-cat tests/fixtures/sample_transcripts.json
+Polling intervals:
 
-# 3. Start infrastructure
-docker-compose up -d
+* Immediate
+* 5 seconds
+* 10 seconds
+* 20 seconds
+* 40 seconds
+* 80 seconds
 
-# 4. Run existing tests (they document current behaviour)
-pip install -r requirements.txt
-pytest tests/ -v
+If the recording becomes available, it is uploaded immediately.
 
-# 5. Start your design document
-cp SUBMISSION_TEMPLATE.md SUBMISSION.md
+If all retries fail:
 
-# 6. Implement your solution
-# You may change any part of the codebase, including the API interface.
-# Explain significant interface changes in SUBMISSION.md.
-```
+* structured error log generated,
+* retry information stored,
+* alert raised for operations.
+
+No recording failure is silently ignored.
 
 ---
 
-## Questions?
+## 8. Reliability & Durability
 
-If anything is ambiguous, **state your assumption and proceed.** The follow-up discussion is where we explore assumptions — the submission is where you show your thinking.
+The redesigned pipeline guarantees that interactions are never silently lost.
+
+Improvements include:
+
+* Durable task queue
+* Retry queue
+* Dead-letter queue
+* Exponential backoff
+* Retry state persistence
+* Structured failure logging
+
+Failures remain visible until resolved.
+
+---
+
+## 9. Auditability & Observability
+
+Every interaction receives a unique Correlation ID.
+
+Every processing stage records:
+
+* interaction_id
+* correlation_id
+* customer_id
+* campaign_id
+* processing status
+* retry count
+* token usage
+* timestamps
+* errors
+
+Alerts are generated for:
+
+* LLM utilization above 80%
+* Retry queue growth
+* Recording failures
+* Dead-letter queue entries
+* Persistent processing failures
+
+---
+
+## 10. Data Model
+
+Additional schema objects introduced:
+
+* `customer_llm_budget`
+* `analysis_jobs`
+* `audit_logs`
+
+Additional interaction fields:
+
+* correlation_id
+* processing_priority
+* estimated_tokens
+* actual_tokens
+* analysis_status
+
+These additions support customer budgeting, workflow visibility, and auditing.
+
+---
+
+## 11. Security
+
+Sensitive information includes:
+
+* customer transcripts
+* lead PII
+* call recordings
+* CRM data
+* API credentials
+
+Protection measures:
+
+* TLS for all communication
+* Encryption at rest
+* Restricted IAM access
+* Role-based authorization
+* Audit logging
+* Secret management through environment variables
+
+---
+
+## 12. API Interface
+
+The existing webhook endpoint remains unchanged.
+
+Maintaining backward compatibility avoids changes for the telephony provider while allowing all improvements to be implemented internally.
+
+---
+
+## 13. Trade-offs & Alternatives Considered
+
+| Option                         | Why Considered        | Final Decision                                                |
+| ------------------------------ | --------------------- | ------------------------------------------------------------- |
+| Immediate LLM processing       | Lowest latency        | Rejected because it violates provider rate limits             |
+| Fixed 45-second recording wait | Simple implementation | Replaced with polling and exponential backoff                 |
+| Binary circuit breaker         | Easy to implement     | Replaced with gradual scheduling and prioritization           |
+| Redis-only retries             | Already available     | Extended with durable retry tracking and dead-letter handling |
+
+---
+
+## 14. Known Weaknesses
+
+Current limitations include:
+
+* Scheduler assumes estimated token usage before actual provider response.
+* CRM retry workflow could be further improved.
+* Dynamic customer priority adjustment is not yet implemented.
+
+---
+
+## 15. What I Would Do With More Time
+
+1. Implement adaptive token estimation using historical usage.
+2. Replace Celery with a workflow engine such as Temporal for stronger durability.
+3. Add automatic replay from the dead-letter queue.
+4. Build Grafana dashboards for real-time queue and rate-limit monitoring.
+5. Add customer-configurable prioritization rules through the admin portal.
